@@ -1,0 +1,56 @@
+name: Line scanner
+
+on:
+  schedule:
+    - cron: "*/30 15-23 * * 6"
+    - cron: "*/30 0-3  * * 0"
+    - cron: "*/30 15-23 * * 0"
+    - cron: "*/30 0-3  * * 1"
+    - cron: "0    22-23 * * 4,5"
+    - cron: "0    0-3  * * 5,6"
+    - cron: "0    23   * * 1"
+    - cron: "0    0-3  * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Scan for edges
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TG_TOKEN:     ${{ secrets.TG_TOKEN }}
+          TG_CHAT:      ${{ secrets.TG_CHAT }}
+          WEBHOOK_URL:  ${{ secrets.WEBHOOK_URL }}
+          SPORTS:        americanfootball_ncaaf
+          BOOK_KEY:      hardrockbet
+          ARB_MIN_PCT:   "0.75"
+          VALUE_MIN_PCT: "3.0"
+          MIN_MATCH_CONF: "0.85"
+          BANKROLL:      "1000"
+          CREDIT_FLOOR:  "40"
+        run: python scan.py
+
+      - name: Remember what was already sent
+        run: |
+          git config user.name  "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add state/seen.json
+          git diff --staged --quiet || git commit -m "state: alerts sent [skip ci]"
+          git push

@@ -90,6 +90,11 @@ def notify(text):
 
 
 def fmt_arb(a):
+    if a.get("suspect"):
+        return (f"⚠️ *SUSPECT {a['profit_pct']}%* — {a['game']}\n"
+                f"  A margin this large almost always means the two legs are the\n"
+                f"  SAME side. Read both markets before risking anything.\n"
+                f"  A: {a['leg_a']}\n  B: {a['leg_b']}")
     return (f"*ARB {a['profit_pct']}%* — {a['game']}\n"
             f"  A: {a['leg_a']}  →  stake ${a['stake_hr']}\n"
             f"  B: {a['leg_b']}  →  stake ${a['stake_ex']}\n"

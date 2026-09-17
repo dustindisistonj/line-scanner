@@ -56,7 +56,7 @@ def kelly(fair, cost):
     return max(0.0, (fair * b - q) / b)
 
 # ---------------------------------------------------------------- fetchers
-def fetch_odds_api(markets="h2h,spreads,totals", books=None, regions="us,us2"):
+def fetch_odds_api(markets="h2h", books=None, regions="us"):
     """Consensus board + Hard Rock. Costs credits = markets x regions."""
     if not ODDS_KEY:
         print("  ! ODDS_API_KEY not set - skipping sportsbook side")
@@ -74,27 +74,74 @@ def fetch_odds_api(markets="h2h,spreads,totals", books=None, regions="us,us2"):
           f"remaining {r.headers.get('x-requests-remaining','?')}")
     return r.json()
 
-def fetch_kalshi(series_hint="NCAAF"):
-    """Public markets endpoint. Series tickers change; filter broadly."""
-    out, cursor = [], None
-    base = "https://api.elections.kalshi.com/trade-api/v2/markets"
-    for _ in range(12):
-        p = {"status": "open", "limit": 1000}
-        if cursor:
-            p["cursor"] = cursor
-        try:
-            r = requests.get(base, params=p, timeout=30)
-            if r.status_code != 200:
-                print(f"  ! kalshi {r.status_code}"); break
-            d = r.json()
-        except Exception as e:
-            print(f"  ! kalshi {e}"); break
-        out += [m for m in d.get("markets", [])
-                if series_hint in (m.get("ticker", "") + m.get("event_ticker", "")).upper()]
-        cursor = d.get("cursor")
-        if not cursor:
-            break
-    return out
+KALSHI_BASES = ["https://api.elections.kalshi.com/trade-api/v2",
+                "https://trading-api.kalshi.com/trade-api/v2"]
+KALSHI_SERIES = ["KXNCAAFGAME", "KXNCAAF", "NCAAFGAME", "NCAAF"]
+
+def fetch_kalshi(series_hint="NCAAF", diagnose=False):
+    """Kalshi series tickers change. Try named series first, then sweep."""
+    for base in KALSHI_BASES:
+        for series in KALSHI_SERIES:
+            try:
+                r = requests.get(f"{base}/markets",
+                                 params={"series_ticker": series, "status": "open",
+                                         "limit": 1000}, timeout=30)
+                if r.status_code == 200:
+                    ms = r.json().get("markets", [])
+                    if ms:
+                        print(f"  via series {series}")
+                        return ms
+            except Exception:
+                continue
+
+        # fallback: page the whole open board and filter on ticker text
+        out, cursor, seen_tickers = [], None, set()
+        for _ in range(8):
+            try:
+                p = {"status": "open", "limit": 1000}
+                if cursor:
+                    p["cursor"] = cursor
+                r = requests.get(f"{base}/markets", params=p, timeout=30)
+                if r.status_code != 200:
+                    break
+                d = r.json()
+            except Exception as e:
+                print(f"  ! kalshi {e}")
+                break
+            for m in d.get("markets", []):
+                tick = (m.get("ticker", "") + " " + m.get("event_ticker", "")).upper()
+                seen_tickers.add(tick.split("-")[0])
+                if series_hint in tick or "FOOTBALL" in (m.get("title", "") or "").upper():
+                    out.append(m)
+            cursor = d.get("cursor")
+            if not cursor:
+                break
+        if out:
+            return out
+        if diagnose and seen_tickers:
+            print("  no match. series prefixes visible:",
+                  sorted(seen_tickers)[:40])
+    return []
+
+def poly_outcomes(m):
+    """Return {outcome_name: price} for a Polymarket market.
+
+    Sports markets are titled 'A vs. B' with outcomes ['A','B'], so the title
+    alone never tells you which side a YES/NO buys. We read the outcome names
+    and price them individually. If the names are just Yes/No we cannot tell
+    which team they refer to, so we skip the market entirely.
+    """
+    try:
+        names = json.loads(m.get("outcomes") or "[]")
+        prices = json.loads(m.get("outcomePrices") or "[]")
+    except Exception:
+        return {}
+    if len(names) != len(prices) or not names:
+        return {}
+    if {str(n).strip().lower() for n in names} <= {"yes", "no"}:
+        return {}          # ambiguous - refuse to guess
+    return {str(n): float(p) for n, p in zip(names, prices)}
+
 
 def fetch_polymarket(query="college football"):
     """Gamma API, public. Returns open markets matching the query."""
@@ -215,48 +262,64 @@ def hardrock_price(event, team, market_key="h2h", book_keys=("hardrockbet",)):
                     return x["price"]
     return None
 
-def find_arbs(events, kal_titles, poly_titles, taker=True, bankroll=500,
-              book_keys=("hardrockbet",)):
-    """Hard Rock on one side, an exchange on the other. If the two together
-    cost less than the payout, the profit is locked whatever happens."""
+def find_arbs(events, kal_titles, poly_markets, taker=True, bankroll=500,
+              book_keys=("hardrockbet",), max_plausible=0.08):
+    """Hard Rock on one team, an exchange on the OPPONENT.
+
+    The exchange leg must be an explicit position on the other team. We never
+    infer a side from a market title: a Polymarket market called 'LSU vs. Ole
+    Miss' has outcomes, and only the outcome names say which team a price buys.
+    """
     out = []
     for ev in events:
         home, away = ev["home_team"], ev["away_team"]
-        for team, other in ((home, away), (away, home)):
+        for team, opponent in ((home, away), (away, home)):
             hr = hardrock_price(ev, team, book_keys=book_keys)
             if not hr:
                 continue
             dec = 1 + am_profit(hr)
             legs = []
-            # Kalshi: buying NO on `team` is backing the opponent
-            kt, ks = match_team(team, list(kal_titles))
+
+            # Kalshi: a market titled for the OPPONENT, bought YES
+            kt, ks = match_team(opponent, list(kal_titles))
             if kt:
-                na = kal_titles[kt].get("no_ask")
-                if na:
-                    legs.append(("Kalshi", f"NO on {kt[:40]} @ {na}c",
-                                 kalshi_cost(na, taker), ks))
-            # Polymarket: second outcome price is the opposing side
-            pt, ps = match_team(team, list(poly_titles))
-            if pt:
-                try:
-                    pr = json.loads(poly_titles[pt].get("outcomePrices", "[]"))
-                    if len(pr) > 1:
-                        legs.append(("Polymarket", f"NO on {pt[:40]} @ {float(pr[1]):.2f}",
-                                     poly_cost(float(pr[1]), taker), ps))
-                except Exception:
-                    pass
+                ask = kal_titles[kt].get("yes_ask")
+                if ask:
+                    legs.append(("Kalshi", f"YES on {kt[:44]} @ {ask}c",
+                                 kalshi_cost(ask, taker), ks))
+
+            # Polymarket: the outcome whose NAME is the opponent
+            for m in poly_markets:
+                outs = poly_outcomes(m)
+                if not outs:
+                    continue
+                pick, conf = match_team(opponent, list(outs))
+                if not pick:
+                    continue
+                # the market must also mention our team, or it is a different game
+                mine, _ = match_team(team, [m.get("question", "")])
+                if not mine:
+                    continue
+                legs.append(("Polymarket",
+                             f"{pick} @ {outs[pick]:.2f} in '{m.get('question','')[:38]}'",
+                             poly_cost(outs[pick], taker), conf))
+
             for venue, desc, cost, conf in legs:
                 total = 1 / dec + cost
-                if total < 1:
-                    payout = bankroll / total
-                    out.append(dict(game=f"{away} @ {home}",
-                                    leg_a=f"Hard Rock {team} {hr:+d}",
-                                    leg_b=f"{venue}: {desc}",
-                                    profit_pct=round((1 - total) / total * 100, 2),
-                                    stake_hr=round(payout / dec, 2),
-                                    stake_ex=round(payout * cost, 2),
-                                    returns=round(payout, 2),
-                                    match_conf=conf))
+                if total >= 1:
+                    continue
+                profit = (1 - total) / total
+                payout = bankroll / total
+                row = dict(game=f"{away} @ {home}",
+                           leg_a=f"Hard Rock {team} {hr:+d}",
+                           leg_b=f"{venue}: {desc}",
+                           profit_pct=round(profit * 100, 2),
+                           stake_hr=round(payout / dec, 2),
+                           stake_ex=round(payout * cost, 2),
+                           returns=round(payout, 2),
+                           match_conf=conf,
+                           suspect=profit > max_plausible)
+                out.append(row)
     out.sort(key=lambda r: -r["profit_pct"])
     return out
 
@@ -314,7 +377,7 @@ def scan(min_edge=0.02, bankroll=1000, taker=True, book_keys=("hardrockbet",)):
                                  stake=round(kelly(fair, cost) * 0.25 * bankroll, 2),
                                  books=nbooks, match_conf=round(conf, 2)))
     rows.sort(key=lambda r: -r["edge"])
-    arbs = find_arbs(events, kal_titles, poly_titles, taker, bankroll, book_keys)
+    arbs = find_arbs(events, kal_titles, poly, taker, bankroll, book_keys)
     return rows, arbs
 
 def show(rows, arbs=None):

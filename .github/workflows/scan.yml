@@ -1,16 +1,27 @@
 name: Line scanner
 
+# Each job runs ~28 minutes, scanning every 3 minutes inside that window.
+# GitHub's cron floor is 5 minutes and scheduled jobs get queued anyway, so the
+# in-job loop -- not the cron -- is what delivers a fast refresh.
+#
+# REQUIRES A PUBLIC REPO for unlimited Actions minutes. On a private repo this
+# schedule would exhaust the 2,000 free minutes in about a week.
 on:
   schedule:
-    - cron: "*/30 15-23 * * 6"
-    - cron: "*/30 0-3  * * 0"
-    - cron: "*/30 15-23 * * 0"
-    - cron: "*/30 0-3  * * 1"
-    - cron: "0    22-23 * * 4,5"
-    - cron: "0    0-3  * * 5,6"
-    - cron: "0    23   * * 1"
-    - cron: "0    0-3  * * 2"
+    - cron: "0,30 15-23 * * 6"     # Sat 11:00-19:30 ET
+    - cron: "0,30 0-4   * * 0"     # Sat 20:00-00:30 ET
+    - cron: "0,30 15-23 * * 0"     # Sun 11:00-19:30 ET
+    - cron: "0,30 0-4   * * 1"     # Sun 20:00-00:30 ET
+    - cron: "0,30 22-23 * * 4,5"   # Thu/Fri 18:00-19:30 ET
+    - cron: "0,30 0-4   * * 5,6"   # Thu/Fri 20:00-00:30 ET
+    - cron: "0,30 23    * * 1"     # Mon 19:00-19:30 ET
+    - cron: "0,30 0-4   * * 2"     # Mon 20:00-00:30 ET
   workflow_dispatch:
+    inputs:
+      diagnose:
+        description: "Print Kalshi market samples"
+        type: boolean
+        default: false
 
 concurrency:
   group: scanner
@@ -19,7 +30,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 35
     permissions:
       contents: write
     steps:
@@ -37,20 +48,25 @@ jobs:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TG_TOKEN:     ${{ secrets.TG_TOKEN }}
           TG_CHAT:      ${{ secrets.TG_CHAT }}
-          WEBHOOK_URL:  ${{ secrets.WEBHOOK_URL }}
           SPORTS:        americanfootball_ncaaf
+          MARKETS:       h2h,spreads,totals
           BOOK_KEY:      hardrockbet
+          LOOP_MINUTES:  "28"
+          INTERVAL_SEC:  "180"
           ARB_MIN_PCT:   "0.75"
           VALUE_MIN_PCT: "3.0"
           MIN_MATCH_CONF: "0.85"
           BANKROLL:      "1000"
-          CREDIT_FLOOR:  "40"
+          CREDIT_FLOOR:  "300"
+          DIAGNOSE:      ${{ inputs.diagnose && '1' || '0' }}
         run: python scan.py
 
       - name: Remember what was already sent
+        if: always()
         run: |
           git config user.name  "scanner-bot"
           git config user.email "scanner-bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
           git add state/seen.json
           git diff --staged --quiet || git commit -m "state: alerts sent [skip ci]"
-          git push
+          git push || true

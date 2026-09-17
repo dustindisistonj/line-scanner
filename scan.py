@@ -19,6 +19,7 @@ from pathlib import Path
 import requests
 
 import edge_scanner as es
+import markets as mk
 
 # ---- thresholds: what is actually worth a notification -----------------
 ARB_MIN_PCT      = float(os.environ.get("ARB_MIN_PCT", "0.75"))   # locked profit %
@@ -28,6 +29,10 @@ BANKROLL         = float(os.environ.get("BANKROLL", "1000"))
 BOOK             = os.environ.get("BOOK_KEY", "hardrockbet")
 CREDIT_FLOOR     = int(os.environ.get("CREDIT_FLOOR", "40"))
 REALERT_HOURS    = float(os.environ.get("REALERT_HOURS", "6"))
+LOOP_MINUTES     = float(os.environ.get("LOOP_MINUTES", "0"))    # 0 = single pass
+INTERVAL_SEC     = int(os.environ.get("INTERVAL_SEC", "180"))
+MARKETS_PARAM    = os.environ.get("MARKETS", "h2h,spreads,totals")
+DIAGNOSE         = os.environ.get("DIAGNOSE", "") == "1"
 SPORTS           = [s.strip() for s in
                     os.environ.get("SPORTS", "americanfootball_ncaaf").split(",") if s.strip()]
 
@@ -108,28 +113,24 @@ def fmt_val(v):
             f"stake ${v['stake']} (match {v['match_conf']})")
 
 
-def main():
-    if not es.ODDS_KEY:
-        sys.exit("ODDS_API_KEY not set")
-
-    left = credits_left()
-    print(f"credits remaining: {left}")
-    if left is not None and left < CREDIT_FLOOR:
-        print(f"below floor of {CREDIT_FLOOR} — skipping to protect the month's budget")
-        return
-
-    state = load_state()
+def one_pass(state, diagnose=False):
+    """A single scan across every configured sport. Returns new alert strings."""
     now = datetime.now(timezone.utc).timestamp()
     fresh = []
-
     for sport in SPORTS:
         es.SPORT = sport
-        print(f"\n=== {sport} ===")
-        try:
-            rows, arbs = es.scan(VALUE_MIN_PCT / 100, BANKROLL, True, (BOOK,))
-        except Exception as e:
-            print(f"scan failed for {sport}: {e}")
+        events = es.fetch_odds_api(markets=MARKETS_PARAM, books=None, regions="us")
+        if not events:
             continue
+        kal = es.fetch_kalshi(diagnose=diagnose)
+        poly = es.fetch_polymarket()
+        print(f"  {sport}: {len(events)} games, {len(kal)} kalshi, {len(poly)} poly")
+
+        rows = mk.scan_all(events, kal, poly, taker=True, bankroll=BANKROLL,
+                           min_edge=VALUE_MIN_PCT / 100, book_key=BOOK,
+                           diagnose=diagnose)
+        arbs = es.find_arbs(events, {(m.get("title") or m.get("ticker")): m for m in kal},
+                            poly, True, BANKROLL, (BOOK,))
 
         for a in arbs:
             if a["profit_pct"] < ARB_MIN_PCT or a["match_conf"] < MIN_MATCH_CONF:
@@ -143,20 +144,51 @@ def main():
         for v in rows:
             if v["edge"] * 100 < VALUE_MIN_PCT or v["match_conf"] < MIN_MATCH_CONF:
                 continue
-            key = f"val|{sport}|{v['game']}|{v['side']}|{v['venue']}"
+            key = f"val|{sport}|{v['game']}|{v['market']}|{v['side']}|{v['venue']}"
             if now - state.get(key, 0) < REALERT_HOURS * 3600:
                 continue
             state[key] = now
             fresh.append(fmt_val(v))
+    return fresh
+
+
+def main():
+    if not es.ODDS_KEY:
+        sys.exit("ODDS_API_KEY not set")
+
+    state = load_state()
+    started = time.time()
+    passes = 0
+
+    while True:
+        left = credits_left()
+        if left is not None and left < CREDIT_FLOOR:
+            print(f"credits {left} below floor {CREDIT_FLOOR} — stopping")
+            break
+
+        passes += 1
+        print(f"\n--- pass {passes} (credits left {left}) ---")
+        try:
+            fresh = one_pass(state, diagnose=(DIAGNOSE and passes == 1))
+        except Exception as e:
+            print(f"pass failed: {e}")
+            fresh = []
+
+        if fresh:
+            head = f"🏈 {len(fresh)} opportunit{'y' if len(fresh)==1 else 'ies'}\n\n"
+            tail = "\n\n_Verify both prices before trading. Exchange size may be thinner than shown._"
+            notify(head + "\n\n".join(fresh[:8]) + tail)
+            save_state(state)
+        else:
+            print("  nothing above threshold")
+
+        elapsed = (time.time() - started) / 60
+        if LOOP_MINUTES <= 0 or elapsed + INTERVAL_SEC / 60 >= LOOP_MINUTES:
+            break
+        time.sleep(INTERVAL_SEC)
 
     save_state(state)
-
-    if fresh:
-        head = f"🏈 {len(fresh)} opportunit{'y' if len(fresh)==1 else 'ies'}\n\n"
-        tail = "\n\n_Verify both prices before trading. Exchange size may be thinner than shown._"
-        notify(head + "\n\n".join(fresh[:8]) + tail)
-    else:
-        print("\nnothing above threshold — normal result, no alert sent")
+    print(f"\ndone: {passes} passes in {(time.time()-started)/60:.1f} min")
 
 
 if __name__ == "__main__":

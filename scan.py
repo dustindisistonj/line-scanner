@@ -126,9 +126,21 @@ def one_pass(state, diagnose=False):
         poly = es.fetch_polymarket()
         print(f"  {sport}: {len(events)} games, {len(kal)} kalshi, {len(poly)} poly")
 
+        # min_edge=-1 returns everything; we filter for alerts below but log
+        # the near-misses so we can see whether the threshold is set sanely.
         rows = mk.scan_all(events, kal, poly, taker=True, bankroll=BANKROLL,
-                           min_edge=VALUE_MIN_PCT / 100, book_key=BOOK,
-                           diagnose=diagnose)
+                           min_edge=-1, book_key=BOOK, diagnose=diagnose)
+        if rows:
+            top = rows[:3]
+            print("    best edges this pass: " + " | ".join(
+                f"{r['side'][:22]} {r['venue'][:9]} {r['edge']*100:+.1f}" for r in top))
+            by_venue = {}
+            for r in rows:
+                v = r["venue"]
+                by_venue[v] = max(by_venue.get(v, -9), r["edge"] * 100)
+            print("    best by venue: " + ", ".join(f"{k} {v:+.1f}" for k, v in by_venue.items()))
+        else:
+            print("    no comparable lines found at all (check line matching)")
         arbs = es.find_arbs(events, {(m.get("title") or m.get("ticker")): m for m in kal},
                             poly, True, BANKROLL, (BOOK,))
 

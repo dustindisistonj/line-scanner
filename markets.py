@@ -124,14 +124,34 @@ def kalshi_side(m):
     return None
 
 
-def diagnose_kalshi(kal, n=6):
-    print(f"  -- kalshi sample ({len(kal)} markets) --")
-    for m in kal[:n]:
-        print(f"     ticker={m.get('ticker')} | title={str(m.get('title'))[:46]}")
-        print(f"       sub={str(m.get('yes_sub_title'))[:40]} "
-              f"strike={m.get('floor_strike') or m.get('cap_strike') or m.get('strike')} "
-              f"yes_ask={m.get('yes_ask')} parsed_number={kalshi_number(m)} "
-              f"side={kalshi_side(m)}")
+def diagnose_kalshi(kal, n=5):
+    """Report what Kalshi is actually giving us, not just the first few rows."""
+    quoted = [m for m in kal if isinstance(m.get("yes_ask"), (int, float))
+              and 0 < m.get("yes_ask") < 100]
+    numbered = [m for m in kal if kalshi_number(m) is not None]
+    sided = [m for m in kal if kalshi_side(m) is not None]
+    print(f"  -- kalshi: {len(kal)} markets | {len(quoted)} with a yes_ask "
+          f"| {len(numbered)} with a strike | {len(sided)} over/under --")
+
+    # which event dates are present? tells us if this weekend is even listed
+    dates = {}
+    for mk in kal:
+        t = (mk.get("ticker") or "").split("-")
+        if len(t) > 1:
+            dates[t[1][:7]] = dates.get(t[1][:7], 0) + 1
+    print(f"     event dates: {sorted(dates.items(), key=lambda x: -x[1])[:8]}")
+
+    # all distinct field names, so we can see what Kalshi really returns
+    if kal:
+        print(f"     fields present: {sorted(kal[0].keys())}")
+
+    print("     -- markets WITH quotes --")
+    for mk in quoted[:n]:
+        print(f"       {mk.get('ticker')} | {str(mk.get('title'))[:40]} | "
+              f"bid={mk.get('yes_bid')} ask={mk.get('yes_ask')} "
+              f"vol={mk.get('volume')} strike={kalshi_number(mk)} side={kalshi_side(mk)}")
+    if not quoted:
+        print("       NONE — no tradeable Kalshi prices in this pull")
 
 
 def scan_all(events, kal, poly, taker=True, bankroll=1000, min_edge=0.02,
